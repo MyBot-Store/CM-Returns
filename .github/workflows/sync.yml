@@ -1,4 +1,4 @@
-name: Daily Performance Sync
+name: CM Daily Performance Sync
 
 on:
   # Runs Monday–Friday at 6:00 AM SGT (22:00 UTC previous day)
