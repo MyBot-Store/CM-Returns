@@ -147,22 +147,21 @@ def parse_trades(root):
 def parse_equity_curve(root):
     """
     Reads EquitySummaryByReportDateInBase entries and computes daily
-    Net Liquidation Value (NLV) explicitly as:
+    Net Liquidation Value (NLV) as:
 
-        NLV = cash + stock + securities options + bonds + funds
+        NLV = Securities Gross Position Value (SGPV) + Cash
 
-    This is IBKR's own definition for the Securities segment of an account
-    (see IBKR Glossary: "Net Liquidation Value"). Rather than trusting a
-    single "total" attribute — which silently falls back to a partial or
-    missing value if that exact field wasn't selected when the Flex Query
-    was configured — we reconstruct NLV directly from its defined
-    components. This guarantees the figure matches what IBKR itself shows
-    as "Net Liq" on your account, regardless of which exact field IBKR
-    happens to expose.
+    where SGPV = |stock value| + |options value| + |funds value|
+    (IBKR Glossary: "Securities Gross Position Value" — the absolute value
+    of long and short stock/option/fund positions). For a long-only
+    account this is simply the sum of position market values; taking the
+    absolute value also makes the figure correct if any short positions
+    are ever held.
 
-    Commodities/futures value is intentionally excluded, matching IBKR's
-    Securities-segment NLV definition (this account doesn't trade futures,
-    so it would be $0 anyway).
+    A raw attribute dump is printed for the most recent day so the exact
+    field names IBKR is returning can be visually confirmed against your
+    account's actual Net Liq figure — if anything still looks off, this
+    output tells us precisely which field to adjust.
 
     Excludes value of the IBKR gifted share from each day's balance.
     """
@@ -197,9 +196,7 @@ def parse_equity_curve(root):
 
     def get_float(elem, *names):
         """Try several possible attribute name variants; return the first
-        valid float found, else 0.0. IBKR's exact field naming for options
-        has varied across schema versions (e.g. "stockOptions" vs "options"),
-        so we check multiple candidates rather than assuming one."""
+        valid float found, else 0.0."""
         for name in names:
             v = elem.get(name)
             if v is not None:
@@ -209,9 +206,20 @@ def parse_equity_curve(root):
                     continue
         return 0.0
 
-    # Parse daily NLV from component fields
+    eq_elements = root.findall(".//EquitySummaryByReportDateInBase")
+
+    # ── Raw diagnostic dump for the most recent day ──
+    # Prints every attribute IBKR actually returned, with no guessing,
+    # so the real field names/values for this account are fully visible.
+    if eq_elements:
+        latest_raw = max(eq_elements, key=lambda e: e.get("reportDate") or "")
+        print(f"  RAW EquitySummary attributes for {latest_raw.get('reportDate')}:")
+        for k, v in sorted(latest_raw.attrib.items()):
+            print(f"    {k} = {v}")
+
+    # Parse daily NLV = SGPV (|stock|+|options|+|funds|) + Cash
     equity_points = []
-    for eq in root.findall(".//EquitySummaryByReportDateInBase"):
+    for eq in eq_elements:
         date_str = eq.get("reportDate") or ""
         if not date_str:
             continue
@@ -219,10 +227,11 @@ def parse_equity_curve(root):
         cash    = get_float(eq, "cash")
         stock   = get_float(eq, "stock")
         options = get_float(eq, "stockOptions", "options")
-        bonds   = get_float(eq, "bonds")
         funds   = get_float(eq, "funds", "notes")
+        bonds   = get_float(eq, "bonds")  # included in gross too, if present
 
-        nlv = cash + stock + options + bonds + funds
+        sgpv = abs(stock) + abs(options) + abs(funds) + abs(bonds)
+        nlv  = cash + sgpv
 
         # Subtract excluded symbol value (IBKR gifted share)
         excluded_val = ibkr_daily_value.get(date_str, 0.0)
@@ -231,20 +240,19 @@ def parse_equity_curve(root):
         equity_points.append({
             "date":    date_str,
             "balance": round(adjusted, 2),
-            "_nlv_components": (cash, stock, options, bonds, funds, excluded_val),
+            "_components": (cash, sgpv, excluded_val),
         })
 
     # Sort by date
     equity_points.sort(key=lambda x: x["date"])
 
-    # Print a diagnostic breakdown for the most recent day, so you can
-    # verify this matches the Net Liq figure shown in your IBKR account.
+    # Print a clean breakdown for the most recent day, so you can verify
+    # this matches the Net Liq figure shown in your IBKR account.
     if equity_points:
         latest = equity_points[-1]
-        cash, stock, options, bonds, funds, excluded_val = latest["_nlv_components"]
-        print(f"  NLV breakdown for {latest['date']}: cash=${cash:.2f} stock=${stock:.2f} "
-              f"options=${options:.2f} bonds=${bonds:.2f} funds=${funds:.2f} "
-              f"-> NLV=${cash+stock+options+bonds+funds:.2f} "
+        cash, sgpv, excluded_val = latest["_components"]
+        print(f"  NLV = Cash + SGPV for {latest['date']}: "
+              f"cash=${cash:.2f} + sgpv=${sgpv:.2f} = ${cash+sgpv:.2f} "
               f"(excl. IBKR share: ${excluded_val:.2f}) = ${latest['balance']:.2f}")
 
     # Compute daily P&L
