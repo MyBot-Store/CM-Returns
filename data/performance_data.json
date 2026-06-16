@@ -1,172 +1,31 @@
 {
-  "last_updated": "2026-06-15 23:46 UTC",
+  "strategy": "CM",
+  "last_updated": "2026-06-16",
   "metrics": {
     "starting_balance": 10000.0,
-    "ending_balance": 10605.75,
-    "total_return_pct": 6.06,
-    "sharpe_ratio": 2.5,
-    "max_drawdown_pct": 6.56,
-    "win_rate_pct": 71.4,
-    "profit_factor": 1.4,
-    "total_trades": 49,
-    "winning_trades": 35,
-    "losing_trades": 14
+    "ending_balance": 13568.95,
+    "total_return_pct": 35.69,
+    "max_drawdown_pct": 0.0,
+    "sharpe_ratio": 0.0,
+    "profit_factor": 1.15,
+    "win_rate_pct": 45.45,
+    "total_trades": 11,
+    "winning_trades": 5,
+    "losing_trades": 6
   },
   "equity_curve": [
     {
-      "date": "2026-02-02",
-      "balance": 10030.62,
-      "daily_pnl": 30.62
+      "date": "2026-06-16",
+      "balance": 10000.0,
+      "daily_pnl": 0.0
     },
     {
-      "date": "2026-02-03",
-      "balance": 10043.73,
-      "daily_pnl": 13.12
-    },
-    {
-      "date": "2026-02-04",
-      "balance": 10091.47,
-      "daily_pnl": 47.74
-    },
-    {
-      "date": "2026-02-09",
-      "balance": 10115.3,
-      "daily_pnl": 23.83
-    },
-    {
-      "date": "2026-02-11",
-      "balance": 10128.92,
-      "daily_pnl": 13.62
-    },
-    {
-      "date": "2026-02-20",
-      "balance": 10125.71,
-      "daily_pnl": -3.22
-    },
-    {
-      "date": "2026-02-23",
-      "balance": 10139.72,
-      "daily_pnl": 14.02
-    },
-    {
-      "date": "2026-02-24",
-      "balance": 10153.6,
-      "daily_pnl": 13.87
-    },
-    {
-      "date": "2026-02-25",
-      "balance": 10167.57,
-      "daily_pnl": 13.98
-    },
-    {
-      "date": "2026-02-27",
-      "balance": 10204.87,
-      "daily_pnl": 37.29
-    },
-    {
-      "date": "2026-03-02",
-      "balance": 10219.2,
-      "daily_pnl": 14.34
-    },
-    {
-      "date": "2026-03-03",
-      "balance": 10254.16,
-      "daily_pnl": 34.95
-    },
-    {
-      "date": "2026-03-06",
-      "balance": 10250.67,
-      "daily_pnl": -3.49
-    },
-    {
-      "date": "2026-03-09",
-      "balance": 10351.6,
-      "daily_pnl": 100.93
-    },
-    {
-      "date": "2026-03-10",
-      "balance": 10413.41,
-      "daily_pnl": 61.81
-    },
-    {
-      "date": "2026-03-16",
-      "balance": 10629.72,
-      "daily_pnl": 216.3
-    },
-    {
-      "date": "2026-03-19",
-      "balance": 10729.91,
-      "daily_pnl": 100.2
-    },
-    {
-      "date": "2026-03-23",
-      "balance": 10909.7,
-      "daily_pnl": 179.78
-    },
-    {
-      "date": "2026-03-25",
-      "balance": 11151.12,
-      "daily_pnl": 241.42
-    },
-    {
-      "date": "2026-03-30",
-      "balance": 11147.89,
-      "daily_pnl": -3.23
-    },
-    {
-      "date": "2026-04-30",
-      "balance": 10700.49,
-      "daily_pnl": -447.4
-    },
-    {
-      "date": "2026-05-05",
-      "balance": 10742.05,
-      "daily_pnl": 41.56
-    },
-    {
-      "date": "2026-05-06",
-      "balance": 10814.01,
-      "daily_pnl": 71.96
-    },
-    {
-      "date": "2026-05-07",
-      "balance": 10857.56,
-      "daily_pnl": 43.55
-    },
-    {
-      "date": "2026-05-13",
-      "balance": 11037.65,
-      "daily_pnl": 180.09
-    },
-    {
-      "date": "2026-05-15",
-      "balance": 10883.64,
-      "daily_pnl": -154.01
-    },
-    {
-      "date": "2026-05-20",
-      "balance": 10884.85,
-      "daily_pnl": 1.21
-    },
-    {
-      "date": "2026-06-05",
-      "balance": 10603.78,
-      "daily_pnl": -281.07
-    },
-    {
-      "date": "2026-06-09",
-      "balance": 10450.6,
-      "daily_pnl": -153.19
-    },
-    {
-      "date": "2026-06-10",
-      "balance": 10419.13,
-      "daily_pnl": -31.47
-    },
-    {
-      "date": "2026-06-12",
-      "balance": 10605.75,
-      "daily_pnl": 186.62
+      "date": "20260615",
+      "balance": 13568.95,
+      "daily_pnl": 3568.95
     }
+  ],
+  "excluded_symbols": [
+    "IBKR"
   ]
 }
