@@ -21,8 +21,15 @@ import urllib.error
 STRATEGY_NAME        = "CM"                    # Change to "LML" in the LML repo
 FLEX_TOKEN           = os.environ["IBKR_FLEX_TOKEN"]
 FLEX_QUERY_ID        = os.environ["IBKR_QUERY_ID"]
-# STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10000.00"))
-STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10009.70"))
+STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10000.00"))
+
+# Forces the Flex Query to always return the most recent N calendar days,
+# overriding whatever "Period" is saved in the Flex Query's own configuration
+# in Client Portal. This guards against the query being stuck on a fixed
+# historical date range (e.g. if it was saved as a custom "Jan 1 - Jun 12"
+# window instead of a rolling window) — without this override, a fixed
+# saved range would silently cap the data at that same end date forever.
+FLEX_LOOKBACK_DAYS   = int(os.environ.get("FLEX_LOOKBACK_DAYS", "30"))
 
 # Symbols to completely exclude from all calculations
 EXCLUDED_SYMBOLS     = {"IBKR"}               # IBKR gifted share — excluded
@@ -40,9 +47,11 @@ def request_flex_statement():
         "t": FLEX_TOKEN,
         "q": FLEX_QUERY_ID,
         "v": FLEX_VER,
+        "p": FLEX_LOOKBACK_DAYS,   # explicit lookback override — see comment above
     })
     url = f"{SEND_URL}?{params}"
-    print(f"Requesting Flex statement... Query ID: {FLEX_QUERY_ID}")
+    print(f"Requesting Flex statement... Query ID: {FLEX_QUERY_ID}, "
+          f"lookback override: last {FLEX_LOOKBACK_DAYS} calendar days")
 
     with urllib.request.urlopen(url, timeout=30) as resp:
         raw = resp.read().decode("utf-8")
@@ -63,6 +72,7 @@ def request_flex_statement():
     code = ref.text.strip()
     print(f"Reference code received: {code}")
     return code
+
 
 
 # ── Step 2: Poll until the statement is ready ─────────────────────────────────
@@ -98,6 +108,17 @@ def fetch_flex_statement(ref_code, max_retries=10, wait_sec=10):
                     raise RuntimeError(f"IBKR GetStatement error: {msg}")
 
             print("Statement ready.")
+
+            # Confirm the actual date range IBKR generated this statement
+            # for — this directly verifies whether the lookback override
+            # is working, independent of whatever "Period" is saved in the
+            # Flex Query's own configuration.
+            stmt = root.find(".//FlexStatement")
+            if stmt is not None:
+                from_date = stmt.get("fromDate", "?")
+                to_date   = stmt.get("toDate", "?")
+                print(f"  Statement covers: {from_date} to {to_date}")
+
             return root
 
     raise RuntimeError(f"Statement not ready after {max_retries} attempts.")
