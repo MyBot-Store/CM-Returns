@@ -1,283 +1,414 @@
 """
-performance_sync.py
---------------------
-Pulls trade data from IBKR Flex Query API, calculates equity curve
-and key performance metrics, then saves to data/performance_data.json
-for the Chart.js dashboard to read.
+MAT8 Performance Sync — CM Series
+Fetches live IBKR account data via Flex Web Service API,
+excludes the IBKR gifted share from all calculations,
+and writes performance_data.json for the dashboard.
 
-Required environment variables (set as GitHub Secrets):
-  IBKR_FLEX_TOKEN   - Your Flex Web Service token from IBKR Client Portal
-  IBKR_QUERY_ID     - Your Activity Flex Query ID from IBKR Client Portal
-  STARTING_BALANCE  - Your account starting balance (e.g. "10000.00")
+Place this file at the root of the CM-Returns GitHub repo.
+GitHub Actions runs it daily via sync.yml.
 """
 
 import os
 import json
 import time
-import math
-import requests
+import datetime
 import xml.etree.ElementTree as ET
-from datetime import datetime, date
-from collections import defaultdict
+import urllib.request
+import urllib.parse
+import urllib.error
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+STRATEGY_NAME        = "CM"                    # Change to "LML" in the LML repo
+FLEX_TOKEN           = os.environ["IBKR_FLEX_TOKEN"]
+FLEX_QUERY_ID        = os.environ["IBKR_QUERY_ID"]
+STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10000.00"))
 
-FLEX_TOKEN      = os.environ["IBKR_FLEX_TOKEN"]
-FLEX_QUERY_ID   = os.environ["IBKR_QUERY_ID"]
-STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", "10000.00"))
+# Symbols to completely exclude from all calculations
+EXCLUDED_SYMBOLS     = {"IBKR"}               # IBKR gifted share — excluded
 
-SEND_URL  = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
-FETCH_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
+OUTPUT_PATH          = "data/performance_data.json"
 
-OUTPUT_FILE = "data/performance_data.json"
+# IBKR Flex Web Service endpoints
+SEND_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
+GET_URL  = "https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
+FLEX_VER = "3"
 
+# ── Step 1: Request the Flex Statement ────────────────────────────────────────
+def request_flex_statement():
+    params = urllib.parse.urlencode({
+        "t": FLEX_TOKEN,
+        "q": FLEX_QUERY_ID,
+        "v": FLEX_VER,
+    })
+    url = f"{SEND_URL}?{params}"
+    print(f"Requesting Flex statement... Query ID: {FLEX_QUERY_ID}")
 
-# ── Step 1: Pull data from IBKR Flex Query ────────────────────────────────────
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        raw = resp.read().decode("utf-8")
 
-def request_flex_report():
-    """Step 1 of 2: Request IBKR to generate the report. Returns a reference code."""
-    print("Requesting Flex report from IBKR...")
-    resp = requests.get(SEND_URL, params={"t": FLEX_TOKEN, "q": FLEX_QUERY_ID, "v": "3"}, timeout=30)
-    resp.raise_for_status()
+    root = ET.fromstring(raw)
 
-    root = ET.fromstring(resp.text)
-    status = root.findtext("Status")
-    if status != "Success":
-        raise RuntimeError(f"IBKR Flex SendRequest failed: {root.findtext('ErrorMessage')}")
+    # Check for errors
+    status = root.find(".//Status")
+    if status is not None and status.text and status.text.strip() != "Success":
+        error = root.find(".//ErrorMessage")
+        msg   = error.text if error is not None else raw
+        raise RuntimeError(f"IBKR SendRequest error: {msg}")
 
-    ref_code = root.findtext("ReferenceCode")
-    print(f"Report requested. Reference code: {ref_code}")
-    return ref_code
+    ref = root.find(".//ReferenceCode")
+    if ref is None or not ref.text:
+        raise RuntimeError(f"No ReferenceCode in response: {raw}")
 
-
-def fetch_flex_report(ref_code):
-    """Step 2 of 2: Fetch the generated report using the reference code."""
-    print("Fetching Flex report...")
-    # IBKR recommends waiting a few seconds before fetching
-    time.sleep(5)
-
-    for attempt in range(5):
-        resp = requests.get(FETCH_URL, params={"t": FLEX_TOKEN, "q": ref_code, "v": "3"}, timeout=30)
-        resp.raise_for_status()
-
-        # If report not ready yet, IBKR returns a status XML
-        if "<FlexQueryResponse" in resp.text or "<FlexStatements" in resp.text:
-            print("Report received.")
-            return resp.text
-
-        # Check if it's a "not ready" response
-        try:
-            root = ET.fromstring(resp.text)
-            if root.findtext("Status") == "Warn":
-                print(f"  Report not ready (attempt {attempt+1}/5), waiting 5s...")
-                time.sleep(5)
-                continue
-        except ET.ParseError:
-            pass
-
-        raise RuntimeError(f"Unexpected IBKR response: {resp.text[:300]}")
-
-    raise RuntimeError("IBKR report not ready after 5 attempts.")
+    code = ref.text.strip()
+    print(f"Reference code received: {code}")
+    return code
 
 
-# ── Step 2: Parse XML and extract trades ──────────────────────────────────────
+# ── Step 2: Poll until the statement is ready ─────────────────────────────────
+def fetch_flex_statement(ref_code, max_retries=10, wait_sec=10):
+    for attempt in range(1, max_retries + 1):
+        print(f"Fetching statement (attempt {attempt}/{max_retries})...")
+        time.sleep(wait_sec)
 
-def parse_trades(xml_text):
-    """
-    Parses IBKR Flex Query XML and returns a list of closed trade dicts.
-    Only closed trades (openCloseIndicator == 'C') have realized P&L.
-    """
-    root = ET.fromstring(xml_text)
+        params = urllib.parse.urlencode({
+            "t": FLEX_TOKEN,
+            "q": ref_code,
+            "v": FLEX_VER,
+        })
+        url = f"{GET_URL}?{params}"
+
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+
+        # If it's XML starting with FlexQueryResponse it's ready
+        if raw.strip().startswith("<?xml") or raw.strip().startswith("<FlexQueryResponse"):
+            root = ET.fromstring(raw)
+
+            # Check if still pending
+            status = root.find(".//Status")
+            if status is not None and status.text:
+                txt = status.text.strip()
+                if txt in ("Statement generation in progress.", "Please wait"):
+                    print(f"  Still generating... waiting {wait_sec}s")
+                    continue
+                if txt not in ("Success", ""):
+                    error = root.find(".//ErrorMessage")
+                    msg   = error.text if error is not None else txt
+                    raise RuntimeError(f"IBKR GetStatement error: {msg}")
+
+            print("Statement ready.")
+            return root
+
+    raise RuntimeError(f"Statement not ready after {max_retries} attempts.")
+
+
+# ── Step 3: Parse trades — exclude IBKR symbol ────────────────────────────────
+def parse_trades(root):
     trades = []
-
-    for trade in root.iter("Trade"):
-        indicator = trade.get("openCloseIndicator", "")
-        # Only process closed trades — these have realized P&L
-        if "C" not in indicator:
+    for t in root.findall(".//Trade"):
+        sym  = (t.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            print(f"  Skipping excluded symbol: {sym}")
             continue
 
+        # Only closed trades (buySell="BUY"/"SELL" with a realizedPnL)
+        pnl_str = t.get("fifoPnlRealized") or t.get("realizedPnL") or "0"
         try:
-            trade_date_str = trade.get("tradeDate", "")
-            if not trade_date_str:
-                continue
-
-            # IBKR date format is YYYYMMDD
-            trade_date = datetime.strptime(trade_date_str, "%Y%m%d").date()
-
-            realized_pnl  = float(trade.get("fifoPnlRealized", 0) or 0)
-            commission     = float(trade.get("ibCommission", 0) or 0)
-            net_pnl        = realized_pnl + commission  # commission is already negative in IBKR data
-
-            buy_sell       = trade.get("buySell", "")
-            symbol         = trade.get("symbol", "")
-
-            trades.append({
-                "date":        trade_date,
-                "symbol":      symbol,
-                "buy_sell":    buy_sell,
-                "realized_pnl": realized_pnl,
-                "commission":  commission,
-                "net_pnl":     net_pnl,
-            })
-
-        except (ValueError, TypeError) as e:
-            print(f"  Skipping trade row due to parse error: {e}")
+            pnl = float(pnl_str)
+        except ValueError:
             continue
 
-    print(f"Parsed {len(trades)} closed trades.")
+        # Skip opening legs (no realised P&L yet)
+        open_close = (t.get("openCloseIndicator") or "").upper()
+        if open_close == "O":
+            continue
+
+        comm_str = t.get("ibCommission") or t.get("commission") or "0"
+        try:
+            comm = float(comm_str)
+        except ValueError:
+            comm = 0.0
+
+        net_pnl = pnl + comm  # commission is already negative in IBKR data
+
+        date_str = t.get("tradeDate") or t.get("dateTime", "")[:8]
+        trades.append({
+            "date":    date_str,
+            "symbol":  sym,
+            "pnl":     net_pnl,
+            "won":     net_pnl > 0,
+        })
+
+    print(f"Parsed {len(trades)} closed trades (IBKR symbol excluded)")
     return trades
 
 
-# ── Step 3: Calculate equity curve ───────────────────────────────────────────
-
-def calculate_equity_curve(trades, starting_balance):
+# ── Step 4: Parse equity curve from EquitySummaryByReportDateInBase ───────────
+def parse_equity_curve(root):
     """
-    Builds a day-by-day equity curve from closed trade P&L.
-    Returns a sorted list of {date, balance, daily_pnl} dicts.
+    Reads EquitySummaryByReportDateInBase entries.
+    Excludes value of IBKR gifted share from each day's balance.
     """
-    # Group net P&L by date
-    daily_pnl = defaultdict(float)
-    for t in trades:
-        daily_pnl[t["date"]] += t["net_pnl"]
+    # Build a map of date → IBKR stock value (to subtract)
+    ibkr_daily_value = {}
+    for pos in root.findall(".//OpenPosition"):
+        sym = (pos.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            report_date = pos.get("reportDate") or ""
+            mkt_val_str = pos.get("positionValue") or pos.get("markPrice") or "0"
+            qty_str     = pos.get("position") or "1"
+            try:
+                mkt_val = float(mkt_val_str)
+                # If only markPrice given, multiply by qty
+                if pos.get("positionValue") is None:
+                    mkt_val = float(mkt_val_str) * float(qty_str)
+                ibkr_daily_value[report_date] = mkt_val
+                print(f"  IBKR gifted share value on {report_date}: ${mkt_val:.2f} (will be excluded)")
+            except ValueError:
+                pass
 
-    if not daily_pnl:
-        print("Warning: No trade data found. Returning empty equity curve.")
-        return []
+    # Also check MarkToMarket for daily IBKR values
+    for mtm in root.findall(".//MarkToMarketPerformanceSummaryUnderlying"):
+        sym = (mtm.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            date_str = mtm.get("reportDate") or ""
+            val_str  = mtm.get("endingValue") or "0"
+            try:
+                ibkr_daily_value[date_str] = float(val_str)
+            except ValueError:
+                pass
 
-    # Build equity curve in chronological order
-    sorted_dates = sorted(daily_pnl.keys())
-    curve = []
-    balance = starting_balance
+    # Parse daily equity totals
+    equity_points = []
+    for eq in root.findall(".//EquitySummaryByReportDateInBase"):
+        date_str = eq.get("reportDate") or ""
+        if not date_str:
+            continue
 
-    for d in sorted_dates:
-        pnl = daily_pnl[d]
-        balance += pnl
-        curve.append({
-            "date":      d.strftime("%Y-%m-%d"),
-            "balance":   round(balance, 2),
-            "daily_pnl": round(pnl, 2),
+        total_str = (
+            eq.get("total") or
+            eq.get("totalLong") or
+            eq.get("endingEquity") or
+            "0"
+        )
+        try:
+            total = float(total_str)
+        except ValueError:
+            continue
+
+        # Subtract excluded symbol value
+        excluded_val = ibkr_daily_value.get(date_str, 0.0)
+        adjusted     = total - excluded_val
+
+        equity_points.append({
+            "date":    date_str,
+            "balance": round(adjusted, 2),
         })
 
+    # Sort by date
+    equity_points.sort(key=lambda x: x["date"])
+
+    # Compute daily P&L
+    prev_balance = STARTING_BALANCE
+    curve = []
+    for pt in equity_points:
+        daily_pnl = round(pt["balance"] - prev_balance, 2)
+        curve.append({
+            "date":      pt["date"],
+            "balance":   pt["balance"],
+            "daily_pnl": daily_pnl,
+        })
+        prev_balance = pt["balance"]
+
+    print(f"Equity curve: {len(curve)} data points")
     return curve
 
 
-# ── Step 4: Calculate performance metrics ─────────────────────────────────────
-
-def calculate_metrics(trades, equity_curve, starting_balance):
+# ── Step 4b: Capture value of currently OPEN (unclosed) positions ─────────────
+def get_open_positions_summary(root):
     """
-    Calculates key statistics investors care about:
-    Total Return, Sharpe Ratio, Max Drawdown, Win Rate, Profit Factor.
+    Reads the OpenPosition section — IBKR's live snapshot of current holdings —
+    and sums their mark-to-market value, excluding any symbol in EXCLUDED_SYMBOLS
+    (e.g. the gifted IBKR share).
+
+    This exists because EquitySummaryByReportDateInBase carries a built-in
+    one-day reporting lag: a position opened today won't be reflected in the
+    official daily NAV total until tomorrow's statement. Reading OpenPosition
+    directly lets us value still-open trades using their latest known mark
+    price, so the equity curve doesn't show a gap or flat day while a trade
+    is active.
     """
-    if not equity_curve or not trades:
-        return {}
+    positions = []
+    for pos in root.findall(".//OpenPosition"):
+        sym = (pos.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            continue
 
-    ending_balance = equity_curve[-1]["balance"]
-    total_return_pct = ((ending_balance - starting_balance) / starting_balance) * 100
+        report_date = pos.get("reportDate") or ""
+        val_str = pos.get("positionValue")
+        if val_str is not None:
+            try:
+                val = float(val_str)
+            except ValueError:
+                val = 0.0
+        else:
+            qty_str  = pos.get("position")  or "0"
+            mark_str = pos.get("markPrice") or "0"
+            try:
+                val = float(qty_str) * float(mark_str)
+            except ValueError:
+                val = 0.0
 
-    # Daily returns (as decimals) for Sharpe calculation
-    balances = [starting_balance] + [row["balance"] for row in equity_curve]
-    daily_returns = [
-        (balances[i] - balances[i-1]) / balances[i-1]
-        for i in range(1, len(balances))
-        if balances[i-1] != 0
-    ]
+        positions.append({"symbol": sym, "value": val, "report_date": report_date})
 
-    # Sharpe Ratio (annualised, assumes 252 trading days, risk-free rate ~0)
-    if len(daily_returns) >= 2:
-        mean_return = sum(daily_returns) / len(daily_returns)
-        variance = sum((r - mean_return) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
-        std_dev = math.sqrt(variance) if variance > 0 else 0
-        sharpe = (mean_return / std_dev) * math.sqrt(252) if std_dev > 0 else 0
+    total_value = sum(p["value"] for p in positions)
+    latest_date = max((p["report_date"] for p in positions if p["report_date"]), default=None)
+
+    if positions:
+        print(f"  Open positions (excl. excluded symbols): {len(positions)} "
+              f"({', '.join(p['symbol'] for p in positions)}), "
+              f"total mark-to-market value: ${total_value:.2f}, as of {latest_date}")
     else:
-        sharpe = 0
+        print("  No currently open positions found.")
 
-    # Maximum Drawdown
-    peak = starting_balance
-    max_dd = 0
-    for row in equity_curve:
-        b = row["balance"]
-        if b > peak:
-            peak = b
-        dd = (peak - b) / peak * 100 if peak > 0 else 0
+    return total_value, latest_date
+
+
+def apply_open_position_value(equity_curve, open_value, open_date):
+    """
+    Ensures the equity curve reflects the current value of open (unclosed)
+    positions, instead of that value being missing until the trade closes.
+
+    - If open_date matches the latest equity curve entry's date, the open
+      position value is added directly into that entry (it's part of that
+      day's true total value, just not yet reflected in the official NAV
+      total at the time the report was generated).
+    - If open_date is MORE RECENT than the latest equity curve entry (i.e.
+      the trade opened on a day not yet covered by an official EquitySummary
+      entry), a new entry is appended for that date so the open trade's
+      value isn't simply absent from the chart while it's still active.
+    """
+    if not equity_curve or open_value == 0 or open_date is None:
+        return equity_curve
+
+    last = equity_curve[-1]
+
+    if open_date == last["date"]:
+        prev_balance = equity_curve[-2]["balance"] if len(equity_curve) > 1 else STARTING_BALANCE
+        last["balance"] = round(last["balance"] + open_value, 2)
+        last["daily_pnl"] = round(last["balance"] - prev_balance, 2)
+        print(f"  Added open position value ${open_value:.2f} into existing entry for {last['date']}")
+    elif open_date > last["date"]:
+        new_balance = round(last["balance"] + open_value, 2)
+        equity_curve.append({
+            "date":      open_date,
+            "balance":   new_balance,
+            "daily_pnl": round(new_balance - last["balance"], 2),
+        })
+        print(f"  Appended new entry for {open_date} including open position value ${open_value:.2f}")
+
+    return equity_curve
+
+
+# ── Step 5: Build metrics from trades and equity curve ────────────────────────
+def build_metrics(trades, equity_curve):
+    total_trades   = len(trades)
+    winning_trades = sum(1 for t in trades if t["won"])
+    losing_trades  = total_trades - winning_trades
+    win_rate_pct   = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+
+    gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gross_loss   = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+
+    ending_balance   = equity_curve[-1]["balance"] if equity_curve else STARTING_BALANCE
+    total_return_pct = ((ending_balance - STARTING_BALANCE) / STARTING_BALANCE * 100)
+
+    # Max drawdown
+    peak = STARTING_BALANCE
+    max_dd = 0.0
+    for pt in equity_curve:
+        bal = pt["balance"]
+        if bal > peak:
+            peak = bal
+        dd = (peak - bal) / peak * 100 if peak > 0 else 0
         if dd > max_dd:
             max_dd = dd
 
-    # Win Rate & Profit Factor (trade-level)
-    closed_trades = [t for t in trades if t["net_pnl"] != 0]
-    winners = [t for t in closed_trades if t["net_pnl"] > 0]
-    losers  = [t for t in closed_trades if t["net_pnl"] < 0]
-
-    win_rate = (len(winners) / len(closed_trades) * 100) if closed_trades else 0
-
-    gross_profit = sum(t["net_pnl"] for t in winners)
-    gross_loss   = abs(sum(t["net_pnl"] for t in losers))
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0
+    # Sharpe (simplified annualised daily returns)
+    daily_pnls = [pt["daily_pnl"] for pt in equity_curve if pt["daily_pnl"] != 0]
+    sharpe = 0.0
+    if len(daily_pnls) > 1:
+        import statistics
+        mean_pnl = statistics.mean(daily_pnls)
+        std_pnl  = statistics.stdev(daily_pnls)
+        if std_pnl > 0:
+            sharpe = round((mean_pnl / std_pnl) * (252 ** 0.5), 2)
 
     return {
-        "starting_balance":  round(starting_balance, 2),
+        "starting_balance":  round(STARTING_BALANCE, 2),
         "ending_balance":    round(ending_balance, 2),
         "total_return_pct":  round(total_return_pct, 2),
-        "sharpe_ratio":      round(sharpe, 2),
         "max_drawdown_pct":  round(max_dd, 2),
-        "win_rate_pct":      round(win_rate, 1),
+        "sharpe_ratio":      sharpe,
         "profit_factor":     round(profit_factor, 2),
-        "total_trades":      len(closed_trades),
-        "winning_trades":    len(winners),
-        "losing_trades":     len(losers),
+        "win_rate_pct":      round(win_rate_pct, 2),
+        "total_trades":      total_trades,
+        "winning_trades":    winning_trades,
+        "losing_trades":     losing_trades,
     }
 
 
-# ── Step 5: Save output JSON ───────────────────────────────────────────────────
-
-def save_output(equity_curve, metrics):
-    """Saves equity curve + metrics to the JSON file read by Chart.js."""
+# ── Step 6: Write JSON output ──────────────────────────────────────────────────
+def write_output(metrics, equity_curve):
     os.makedirs("data", exist_ok=True)
-
-    output = {
-        "last_updated":  datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-        "metrics":       metrics,
-        "equity_curve":  equity_curve,
+    payload = {
+        "strategy":    STRATEGY_NAME,
+        "last_updated": datetime.date.today().isoformat(),
+        "metrics":     metrics,
+        "equity_curve": equity_curve,
+        "excluded_symbols": list(EXCLUDED_SYMBOLS),
     }
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Written: {OUTPUT_PATH}")
+    print(f"  Strategy:       {STRATEGY_NAME}")
+    print(f"  Trades:         {metrics['total_trades']}")
+    print(f"  Total Return:   {metrics['total_return_pct']:.2f}%")
+    print(f"  Max Drawdown:   {metrics['max_drawdown_pct']:.2f}%")
+    print(f"  Sharpe:         {metrics['sharpe_ratio']}")
+    print(f"  Excluded:       {list(EXCLUDED_SYMBOLS)}")
 
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(output, f, indent=2)
 
-    print(f"Saved {len(equity_curve)} data points to {OUTPUT_FILE}")
-    print(f"Metrics: {json.dumps(metrics, indent=2)}")
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    print(f"=== MAT8 Performance Sync: {STRATEGY_NAME} ===")
+    print(f"Excluded symbols: {EXCLUDED_SYMBOLS}")
+    print()
 
+    ref_code     = request_flex_statement()
+    root         = fetch_flex_statement(ref_code)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    trades       = parse_trades(root)
+    equity_curve = parse_equity_curve(root)
+
+    if not equity_curve:
+        print("WARNING: No equity curve data found. Check Flex Query sections.")
+        equity_curve = [{
+            "date":      datetime.date.today().isoformat(),
+            "balance":   STARTING_BALANCE,
+            "daily_pnl": 0.0,
+        }]
+
+    # Add in the current value of any still-open (unclosed) positions, so the
+    # latest data point reflects total estimated value, not just closed trades.
+    open_value, open_date = get_open_positions_summary(root)
+    equity_curve = apply_open_position_value(equity_curve, open_value, open_date)
+
+    metrics = build_metrics(trades, equity_curve)
+    write_output(metrics, equity_curve)
+    print("\nSync complete.")
+
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("IBKR Performance Sync")
-    print(f"Starting balance: ${STARTING_BALANCE:,.2f}")
-    print("=" * 50)
-
-    try:
-        # 1. Pull data from IBKR
-        ref_code = request_flex_report()
-        xml_data = fetch_flex_report(ref_code)
-
-        # 2. Parse trades
-        trades = parse_trades(xml_data)
-
-        if not trades:
-            print("No closed trades found. Check your Flex Query date range.")
-            # Save empty output so dashboard shows gracefully
-            save_output([], {})
-        else:
-            # 3. Build equity curve
-            equity_curve = calculate_equity_curve(trades, STARTING_BALANCE)
-
-            # 4. Calculate metrics
-            metrics = calculate_metrics(trades, equity_curve, STARTING_BALANCE)
-
-            # 5. Save output
-            save_output(equity_curve, metrics)
-
-        print("Done.")
-
-    except Exception as e:
-        print(f"ERROR: {e}")
-        raise
+    main()
