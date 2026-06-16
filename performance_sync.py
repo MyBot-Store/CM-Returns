@@ -21,7 +21,8 @@ import urllib.error
 STRATEGY_NAME        = "CM"                    # Change to "LML" in the LML repo
 FLEX_TOKEN           = os.environ["IBKR_FLEX_TOKEN"]
 FLEX_QUERY_ID        = os.environ["IBKR_QUERY_ID"]
-STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10000.00"))
+# STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10000.00"))
+STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10009.70"))
 
 # Symbols to completely exclude from all calculations
 EXCLUDED_SYMBOLS     = {"IBKR"}               # IBKR gifted share — excluded
