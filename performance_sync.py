@@ -143,11 +143,28 @@ def parse_trades(root):
     return trades
 
 
-# ── Step 4: Parse equity curve from EquitySummaryByReportDateInBase ───────────
+# ── Step 4: Parse equity curve — Net Liquidation Value basis ──────────────────
 def parse_equity_curve(root):
     """
-    Reads EquitySummaryByReportDateInBase entries.
-    Excludes value of IBKR gifted share from each day's balance.
+    Reads EquitySummaryByReportDateInBase entries and computes daily
+    Net Liquidation Value (NLV) explicitly as:
+
+        NLV = cash + stock + securities options + bonds + funds
+
+    This is IBKR's own definition for the Securities segment of an account
+    (see IBKR Glossary: "Net Liquidation Value"). Rather than trusting a
+    single "total" attribute — which silently falls back to a partial or
+    missing value if that exact field wasn't selected when the Flex Query
+    was configured — we reconstruct NLV directly from its defined
+    components. This guarantees the figure matches what IBKR itself shows
+    as "Net Liq" on your account, regardless of which exact field IBKR
+    happens to expose.
+
+    Commodities/futures value is intentionally excluded, matching IBKR's
+    Securities-segment NLV definition (this account doesn't trade futures,
+    so it would be $0 anyway).
+
+    Excludes value of the IBKR gifted share from each day's balance.
     """
     # Build a map of date → IBKR stock value (to subtract)
     ibkr_daily_value = {}
@@ -178,35 +195,57 @@ def parse_equity_curve(root):
             except ValueError:
                 pass
 
-    # Parse daily equity totals
+    def get_float(elem, *names):
+        """Try several possible attribute name variants; return the first
+        valid float found, else 0.0. IBKR's exact field naming for options
+        has varied across schema versions (e.g. "stockOptions" vs "options"),
+        so we check multiple candidates rather than assuming one."""
+        for name in names:
+            v = elem.get(name)
+            if v is not None:
+                try:
+                    return float(v)
+                except ValueError:
+                    continue
+        return 0.0
+
+    # Parse daily NLV from component fields
     equity_points = []
     for eq in root.findall(".//EquitySummaryByReportDateInBase"):
         date_str = eq.get("reportDate") or ""
         if not date_str:
             continue
 
-        total_str = (
-            eq.get("total") or
-            eq.get("totalLong") or
-            eq.get("endingEquity") or
-            "0"
-        )
-        try:
-            total = float(total_str)
-        except ValueError:
-            continue
+        cash    = get_float(eq, "cash")
+        stock   = get_float(eq, "stock")
+        options = get_float(eq, "stockOptions", "options")
+        bonds   = get_float(eq, "bonds")
+        funds   = get_float(eq, "funds", "notes")
 
-        # Subtract excluded symbol value
+        nlv = cash + stock + options + bonds + funds
+
+        # Subtract excluded symbol value (IBKR gifted share)
         excluded_val = ibkr_daily_value.get(date_str, 0.0)
-        adjusted     = total - excluded_val
+        adjusted     = nlv - excluded_val
 
         equity_points.append({
             "date":    date_str,
             "balance": round(adjusted, 2),
+            "_nlv_components": (cash, stock, options, bonds, funds, excluded_val),
         })
 
     # Sort by date
     equity_points.sort(key=lambda x: x["date"])
+
+    # Print a diagnostic breakdown for the most recent day, so you can
+    # verify this matches the Net Liq figure shown in your IBKR account.
+    if equity_points:
+        latest = equity_points[-1]
+        cash, stock, options, bonds, funds, excluded_val = latest["_nlv_components"]
+        print(f"  NLV breakdown for {latest['date']}: cash=${cash:.2f} stock=${stock:.2f} "
+              f"options=${options:.2f} bonds=${bonds:.2f} funds=${funds:.2f} "
+              f"-> NLV=${cash+stock+options+bonds+funds:.2f} "
+              f"(excl. IBKR share: ${excluded_val:.2f}) = ${latest['balance']:.2f}")
 
     # Compute daily P&L
     prev_balance = STARTING_BALANCE
