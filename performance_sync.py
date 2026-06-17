@@ -23,14 +23,6 @@ FLEX_TOKEN           = os.environ["IBKR_FLEX_TOKEN"]
 FLEX_QUERY_ID        = os.environ["IBKR_QUERY_ID"]
 STARTING_BALANCE     = float(os.environ.get("STARTING_BALANCE", "10000.00"))
 
-# Forces the Flex Query to always return the most recent N calendar days,
-# overriding whatever "Period" is saved in the Flex Query's own configuration
-# in Client Portal. This guards against the query being stuck on a fixed
-# historical date range (e.g. if it was saved as a custom "Jan 1 - Jun 12"
-# window instead of a rolling window) — without this override, a fixed
-# saved range would silently cap the data at that same end date forever.
-FLEX_LOOKBACK_DAYS   = int(os.environ.get("FLEX_LOOKBACK_DAYS", "30"))
-
 # Symbols to completely exclude from all calculations
 EXCLUDED_SYMBOLS     = {"IBKR"}               # IBKR gifted share — excluded
 
@@ -47,11 +39,9 @@ def request_flex_statement():
         "t": FLEX_TOKEN,
         "q": FLEX_QUERY_ID,
         "v": FLEX_VER,
-        "p": FLEX_LOOKBACK_DAYS,   # explicit lookback override — see comment above
     })
     url = f"{SEND_URL}?{params}"
-    print(f"Requesting Flex statement... Query ID: {FLEX_QUERY_ID}, "
-          f"lookback override: last {FLEX_LOOKBACK_DAYS} calendar days")
+    print(f"Requesting Flex statement... Query ID: {FLEX_QUERY_ID}")
 
     with urllib.request.urlopen(url, timeout=30) as resp:
         raw = resp.read().decode("utf-8")
@@ -72,7 +62,6 @@ def request_flex_statement():
     code = ref.text.strip()
     print(f"Reference code received: {code}")
     return code
-
 
 
 # ── Step 2: Poll until the statement is ready ─────────────────────────────────
@@ -108,17 +97,6 @@ def fetch_flex_statement(ref_code, max_retries=10, wait_sec=10):
                     raise RuntimeError(f"IBKR GetStatement error: {msg}")
 
             print("Statement ready.")
-
-            # Confirm the actual date range IBKR generated this statement
-            # for — this directly verifies whether the lookback override
-            # is working, independent of whatever "Period" is saved in the
-            # Flex Query's own configuration.
-            stmt = root.find(".//FlexStatement")
-            if stmt is not None:
-                from_date = stmt.get("fromDate", "?")
-                to_date   = stmt.get("toDate", "?")
-                print(f"  Statement covers: {from_date} to {to_date}")
-
             return root
 
     raise RuntimeError(f"Statement not ready after {max_retries} attempts.")
@@ -165,27 +143,11 @@ def parse_trades(root):
     return trades
 
 
-# ── Step 4: Parse equity curve — Net Liquidation Value basis ──────────────────
+# ── Step 4: Parse equity curve from EquitySummaryByReportDateInBase ───────────
 def parse_equity_curve(root):
     """
-    Reads EquitySummaryByReportDateInBase entries and computes daily
-    Net Liquidation Value (NLV) as:
-
-        NLV = Securities Gross Position Value (SGPV) + Cash
-
-    where SGPV = |stock value| + |options value| + |funds value|
-    (IBKR Glossary: "Securities Gross Position Value" — the absolute value
-    of long and short stock/option/fund positions). For a long-only
-    account this is simply the sum of position market values; taking the
-    absolute value also makes the figure correct if any short positions
-    are ever held.
-
-    A raw attribute dump is printed for the most recent day so the exact
-    field names IBKR is returning can be visually confirmed against your
-    account's actual Net Liq figure — if anything still looks off, this
-    output tells us precisely which field to adjust.
-
-    Excludes value of the IBKR gifted share from each day's balance.
+    Reads EquitySummaryByReportDateInBase entries.
+    Excludes value of IBKR gifted share from each day's balance.
     """
     # Build a map of date → IBKR stock value (to subtract)
     ibkr_daily_value = {}
@@ -216,66 +178,35 @@ def parse_equity_curve(root):
             except ValueError:
                 pass
 
-    def get_float(elem, *names):
-        """Try several possible attribute name variants; return the first
-        valid float found, else 0.0."""
-        for name in names:
-            v = elem.get(name)
-            if v is not None:
-                try:
-                    return float(v)
-                except ValueError:
-                    continue
-        return 0.0
-
-    eq_elements = root.findall(".//EquitySummaryByReportDateInBase")
-
-    # ── Raw diagnostic dump for the most recent day ──
-    # Prints every attribute IBKR actually returned, with no guessing,
-    # so the real field names/values for this account are fully visible.
-    if eq_elements:
-        latest_raw = max(eq_elements, key=lambda e: e.get("reportDate") or "")
-        print(f"  RAW EquitySummary attributes for {latest_raw.get('reportDate')}:")
-        for k, v in sorted(latest_raw.attrib.items()):
-            print(f"    {k} = {v}")
-
-    # Parse daily NLV = SGPV (|stock|+|options|+|funds|) + Cash
+    # Parse daily equity totals
     equity_points = []
-    for eq in eq_elements:
+    for eq in root.findall(".//EquitySummaryByReportDateInBase"):
         date_str = eq.get("reportDate") or ""
         if not date_str:
             continue
 
-        cash    = get_float(eq, "cash")
-        stock   = get_float(eq, "stock")
-        options = get_float(eq, "stockOptions", "options")
-        funds   = get_float(eq, "funds", "notes")
-        bonds   = get_float(eq, "bonds")  # included in gross too, if present
+        total_str = (
+            eq.get("total") or
+            eq.get("totalLong") or
+            eq.get("endingEquity") or
+            "0"
+        )
+        try:
+            total = float(total_str)
+        except ValueError:
+            continue
 
-        sgpv = abs(stock) + abs(options) + abs(funds) + abs(bonds)
-        nlv  = cash + sgpv
-
-        # Subtract excluded symbol value (IBKR gifted share)
+        # Subtract excluded symbol value
         excluded_val = ibkr_daily_value.get(date_str, 0.0)
-        adjusted     = nlv - excluded_val
+        adjusted     = total - excluded_val
 
         equity_points.append({
             "date":    date_str,
             "balance": round(adjusted, 2),
-            "_components": (cash, sgpv, excluded_val),
         })
 
     # Sort by date
     equity_points.sort(key=lambda x: x["date"])
-
-    # Print a clean breakdown for the most recent day, so you can verify
-    # this matches the Net Liq figure shown in your IBKR account.
-    if equity_points:
-        latest = equity_points[-1]
-        cash, sgpv, excluded_val = latest["_components"]
-        print(f"  NLV = Cash + SGPV for {latest['date']}: "
-              f"cash=${cash:.2f} + sgpv=${sgpv:.2f} = ${cash+sgpv:.2f} "
-              f"(excl. IBKR share: ${excluded_val:.2f}) = ${latest['balance']:.2f}")
 
     # Compute daily P&L
     prev_balance = STARTING_BALANCE
@@ -291,92 +222,6 @@ def parse_equity_curve(root):
 
     print(f"Equity curve: {len(curve)} data points")
     return curve
-
-
-# ── Step 4b: Capture value of currently OPEN (unclosed) positions ─────────────
-def get_open_positions_summary(root):
-    """
-    Reads the OpenPosition section — IBKR's live snapshot of current holdings —
-    and sums their mark-to-market value, excluding any symbol in EXCLUDED_SYMBOLS
-    (e.g. the gifted IBKR share).
-
-    This exists because EquitySummaryByReportDateInBase carries a built-in
-    one-day reporting lag: a position opened today won't be reflected in the
-    official daily NAV total until tomorrow's statement. Reading OpenPosition
-    directly lets us value still-open trades using their latest known mark
-    price, so the equity curve doesn't show a gap or flat day while a trade
-    is active.
-    """
-    positions = []
-    for pos in root.findall(".//OpenPosition"):
-        sym = (pos.get("symbol") or "").strip().upper()
-        if sym in EXCLUDED_SYMBOLS:
-            continue
-
-        report_date = pos.get("reportDate") or ""
-        val_str = pos.get("positionValue")
-        if val_str is not None:
-            try:
-                val = float(val_str)
-            except ValueError:
-                val = 0.0
-        else:
-            qty_str  = pos.get("position")  or "0"
-            mark_str = pos.get("markPrice") or "0"
-            try:
-                val = float(qty_str) * float(mark_str)
-            except ValueError:
-                val = 0.0
-
-        positions.append({"symbol": sym, "value": val, "report_date": report_date})
-
-    total_value = sum(p["value"] for p in positions)
-    latest_date = max((p["report_date"] for p in positions if p["report_date"]), default=None)
-
-    if positions:
-        print(f"  Open positions (excl. excluded symbols): {len(positions)} "
-              f"({', '.join(p['symbol'] for p in positions)}), "
-              f"total mark-to-market value: ${total_value:.2f}, as of {latest_date}")
-    else:
-        print("  No currently open positions found.")
-
-    return total_value, latest_date
-
-
-def apply_open_position_value(equity_curve, open_value, open_date):
-    """
-    Ensures the equity curve reflects the current value of open (unclosed)
-    positions, instead of that value being missing until the trade closes.
-
-    - If open_date matches the latest equity curve entry's date, the open
-      position value is added directly into that entry (it's part of that
-      day's true total value, just not yet reflected in the official NAV
-      total at the time the report was generated).
-    - If open_date is MORE RECENT than the latest equity curve entry (i.e.
-      the trade opened on a day not yet covered by an official EquitySummary
-      entry), a new entry is appended for that date so the open trade's
-      value isn't simply absent from the chart while it's still active.
-    """
-    if not equity_curve or open_value == 0 or open_date is None:
-        return equity_curve
-
-    last = equity_curve[-1]
-
-    if open_date == last["date"]:
-        prev_balance = equity_curve[-2]["balance"] if len(equity_curve) > 1 else STARTING_BALANCE
-        last["balance"] = round(last["balance"] + open_value, 2)
-        last["daily_pnl"] = round(last["balance"] - prev_balance, 2)
-        print(f"  Added open position value ${open_value:.2f} into existing entry for {last['date']}")
-    elif open_date > last["date"]:
-        new_balance = round(last["balance"] + open_value, 2)
-        equity_curve.append({
-            "date":      open_date,
-            "balance":   new_balance,
-            "daily_pnl": round(new_balance - last["balance"], 2),
-        })
-        print(f"  Appended new entry for {open_date} including open position value ${open_value:.2f}")
-
-    return equity_curve
 
 
 # ── Step 5: Build metrics from trades and equity curve ────────────────────────
@@ -468,11 +313,6 @@ def main():
             "balance":   STARTING_BALANCE,
             "daily_pnl": 0.0,
         }]
-
-    # Add in the current value of any still-open (unclosed) positions, so the
-    # latest data point reflects total estimated value, not just closed trades.
-    open_value, open_date = get_open_positions_summary(root)
-    equity_curve = apply_open_position_value(equity_curve, open_value, open_date)
 
     metrics = build_metrics(trades, equity_curve)
     write_output(metrics, equity_curve)
