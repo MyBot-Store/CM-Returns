@@ -224,6 +224,92 @@ def parse_equity_curve(root):
     return curve
 
 
+# ── Step 4b: Capture value of currently OPEN (unclosed) positions ─────────────
+def get_open_positions_summary(root):
+    """
+    Reads the OpenPosition section — IBKR's live snapshot of current holdings —
+    and sums their mark-to-market value, excluding any symbol in EXCLUDED_SYMBOLS
+    (e.g. the gifted IBKR share).
+
+    This exists because EquitySummaryByReportDateInBase carries a built-in
+    one-day reporting lag: a position opened today won't be reflected in the
+    official daily NAV total until tomorrow's statement. Reading OpenPosition
+    directly lets us value still-open trades using their latest known mark
+    price, so the equity curve doesn't show a gap or flat day while a trade
+    is active.
+    """
+    positions = []
+    for pos in root.findall(".//OpenPosition"):
+        sym = (pos.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            continue
+
+        report_date = pos.get("reportDate") or ""
+        val_str = pos.get("positionValue")
+        if val_str is not None:
+            try:
+                val = float(val_str)
+            except ValueError:
+                val = 0.0
+        else:
+            qty_str  = pos.get("position")  or "0"
+            mark_str = pos.get("markPrice") or "0"
+            try:
+                val = float(qty_str) * float(mark_str)
+            except ValueError:
+                val = 0.0
+
+        positions.append({"symbol": sym, "value": val, "report_date": report_date})
+
+    total_value = sum(p["value"] for p in positions)
+    latest_date = max((p["report_date"] for p in positions if p["report_date"]), default=None)
+
+    if positions:
+        print(f"  Open positions (excl. excluded symbols): {len(positions)} "
+              f"({', '.join(p['symbol'] for p in positions)}), "
+              f"total mark-to-market value: ${total_value:.2f}, as of {latest_date}")
+    else:
+        print("  No currently open positions found.")
+
+    return total_value, latest_date
+
+
+def apply_open_position_value(equity_curve, open_value, open_date):
+    """
+    Ensures the equity curve reflects the current value of open (unclosed)
+    positions, instead of that value being missing until the trade closes.
+
+    - If open_date matches the latest equity curve entry's date, the open
+      position value is added directly into that entry (it's part of that
+      day's true total value, just not yet reflected in the official NAV
+      total at the time the report was generated).
+    - If open_date is MORE RECENT than the latest equity curve entry (i.e.
+      the trade opened on a day not yet covered by an official EquitySummary
+      entry), a new entry is appended for that date so the open trade's
+      value isn't simply absent from the chart while it's still active.
+    """
+    if not equity_curve or open_value == 0 or open_date is None:
+        return equity_curve
+
+    last = equity_curve[-1]
+
+    if open_date == last["date"]:
+        prev_balance = equity_curve[-2]["balance"] if len(equity_curve) > 1 else STARTING_BALANCE
+        last["balance"] = round(last["balance"] + open_value, 2)
+        last["daily_pnl"] = round(last["balance"] - prev_balance, 2)
+        print(f"  Added open position value ${open_value:.2f} into existing entry for {last['date']}")
+    elif open_date > last["date"]:
+        new_balance = round(last["balance"] + open_value, 2)
+        equity_curve.append({
+            "date":      open_date,
+            "balance":   new_balance,
+            "daily_pnl": round(new_balance - last["balance"], 2),
+        })
+        print(f"  Appended new entry for {open_date} including open position value ${open_value:.2f}")
+
+    return equity_curve
+
+
 # ── Step 5: Build metrics from trades and equity curve ────────────────────────
 def build_metrics(trades, equity_curve):
     total_trades   = len(trades)
@@ -313,6 +399,11 @@ def main():
             "balance":   STARTING_BALANCE,
             "daily_pnl": 0.0,
         }]
+
+    # Add in the current value of any still-open (unclosed) positions, so the
+    # latest data point reflects total estimated value, not just closed trades.
+    open_value, open_date = get_open_positions_summary(root)
+    equity_curve = apply_open_position_value(equity_curve, open_value, open_date)
 
     metrics = build_metrics(trades, equity_curve)
     write_output(metrics, equity_curve)
