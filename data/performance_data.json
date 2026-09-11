@@ -1,16 +1,16 @@
 {
-  "last_updated": "2026-09-10 23:47 UTC",
+  "last_updated": "2026-09-11 23:55 UTC",
   "metrics": {
     "starting_balance": 10000.0,
-    "ending_balance": 9555.68,
-    "total_return_pct": -4.44,
-    "sharpe_ratio": -0.51,
-    "max_drawdown_pct": 15.51,
-    "win_rate_pct": 67.6,
-    "profit_factor": 0.9,
-    "total_trades": 74,
+    "ending_balance": 9302.56,
+    "total_return_pct": -6.97,
+    "sharpe_ratio": -0.88,
+    "max_drawdown_pct": 16.58,
+    "win_rate_pct": 66.7,
+    "profit_factor": 0.86,
+    "total_trades": 75,
     "winning_trades": 50,
-    "losing_trades": 24
+    "losing_trades": 25
   },
   "equity_curve": [
     {
@@ -272,6 +272,11 @@
       "date": "2026-09-03",
       "balance": 9555.68,
       "daily_pnl": 83.35
+    },
+    {
+      "date": "2026-09-10",
+      "balance": 9302.56,
+      "daily_pnl": -253.13
     }
   ]
 }
