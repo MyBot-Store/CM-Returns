@@ -1,0 +1,348 @@
+"""
+MAT8 Performance Sync — CM Series
+Fetches live IBKR account data via Flex Web Service API,
+excludes the IBKR gifted share from all calculations,
+and writes performance_data.json for the dashboard.
+
+Place this file at the root of the CM-Returns GitHub repo.
+GitHub Actions runs it daily via sync.yml.
+"""
+
+import os
+import json
+import time
+import datetime
+import xml.etree.ElementTree as ET
+import urllib.request
+import urllib.parse
+import urllib.error
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+STRATEGY_NAME        = "CM"                    # Change to "LML" in the LML repo
+FLEX_TOKEN           = os.environ["IBKR_FLEX_TOKEN"]
+FLEX_QUERY_ID        = os.environ["IBKR_QUERY_ID"]
+# STARTING_BALANCE is derived automatically from the first data point
+# returned by the Flex Query (Sept 1 2026) — no manual entry needed.
+# The script reads the Sept 1 equity value directly from IBKR and uses
+# that as the baseline for all return/drawdown calculations.
+STARTING_BALANCE     = None                    # set automatically from first data point
+
+# New algorithm tracking period — September 2026 onwards.
+# fd/td parameters override the Flex Query's own saved Period setting (YTD)
+# directly in the API request, so the data window is always exactly what we
+# intend regardless of what is saved in Client Portal.
+TRACK_FROM           = "20260901"              # Sept 1 2026 — new algo start date
+TRACK_TO             = datetime.date.today().strftime("%Y%m%d")  # always today
+
+# Symbols to completely exclude from all calculations
+EXCLUDED_SYMBOLS     = {"IBKR"}               # IBKR gifted share — excluded
+
+OUTPUT_PATH          = "data/performance_data.json"
+
+# IBKR Flex Web Service endpoints
+SEND_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
+GET_URL  = "https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
+FLEX_VER = "3"
+
+# ── Step 1: Request the Flex Statement ────────────────────────────────────────
+def request_flex_statement():
+    params = urllib.parse.urlencode({
+        "t": FLEX_TOKEN,
+        "q": FLEX_QUERY_ID,
+        "v": FLEX_VER,
+        "fd": TRACK_FROM,          # explicit from-date — overrides saved YTD period
+        "td": TRACK_TO,            # explicit to-date — always today
+    })
+    url = f"{SEND_URL}?{params}"
+    print(f"Requesting Flex statement... Query ID: {FLEX_QUERY_ID}, "
+          f"period: {TRACK_FROM} to {TRACK_TO}")
+
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        raw = resp.read().decode("utf-8")
+
+    root = ET.fromstring(raw)
+
+    # Check for errors
+    status = root.find(".//Status")
+    if status is not None and status.text and status.text.strip() != "Success":
+        error = root.find(".//ErrorMessage")
+        msg   = error.text if error is not None else raw
+        raise RuntimeError(f"IBKR SendRequest error: {msg}")
+
+    ref = root.find(".//ReferenceCode")
+    if ref is None or not ref.text:
+        raise RuntimeError(f"No ReferenceCode in response: {raw}")
+
+    code = ref.text.strip()
+    print(f"Reference code received: {code}")
+    return code
+
+
+# ── Step 2: Poll until the statement is ready ─────────────────────────────────
+def fetch_flex_statement(ref_code, max_retries=10, wait_sec=10):
+    for attempt in range(1, max_retries + 1):
+        print(f"Fetching statement (attempt {attempt}/{max_retries})...")
+        time.sleep(wait_sec)
+
+        params = urllib.parse.urlencode({
+            "t": FLEX_TOKEN,
+            "q": ref_code,
+            "v": FLEX_VER,
+        })
+        url = f"{GET_URL}?{params}"
+
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+
+        # If it's XML starting with FlexQueryResponse it's ready
+        if raw.strip().startswith("<?xml") or raw.strip().startswith("<FlexQueryResponse"):
+            root = ET.fromstring(raw)
+
+            # Check if still pending
+            status = root.find(".//Status")
+            if status is not None and status.text:
+                txt = status.text.strip()
+                if txt in ("Statement generation in progress.", "Please wait"):
+                    print(f"  Still generating... waiting {wait_sec}s")
+                    continue
+                if txt not in ("Success", ""):
+                    error = root.find(".//ErrorMessage")
+                    msg   = error.text if error is not None else txt
+                    raise RuntimeError(f"IBKR GetStatement error: {msg}")
+
+            print("Statement ready.")
+            return root
+
+    raise RuntimeError(f"Statement not ready after {max_retries} attempts.")
+
+
+# ── Step 3: Parse trades — exclude IBKR symbol ────────────────────────────────
+def parse_trades(root):
+    trades = []
+    for t in root.findall(".//Trade"):
+        sym  = (t.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            print(f"  Skipping excluded symbol: {sym}")
+            continue
+
+        # Only closed trades (buySell="BUY"/"SELL" with a realizedPnL)
+        pnl_str = t.get("fifoPnlRealized") or t.get("realizedPnL") or "0"
+        try:
+            pnl = float(pnl_str)
+        except ValueError:
+            continue
+
+        # Skip opening legs (no realised P&L yet)
+        open_close = (t.get("openCloseIndicator") or "").upper()
+        if open_close == "O":
+            continue
+
+        comm_str = t.get("ibCommission") or t.get("commission") or "0"
+        try:
+            comm = float(comm_str)
+        except ValueError:
+            comm = 0.0
+
+        net_pnl = pnl + comm  # commission is already negative in IBKR data
+
+        date_str = t.get("tradeDate") or t.get("dateTime", "")[:8]
+        trades.append({
+            "date":    date_str,
+            "symbol":  sym,
+            "pnl":     net_pnl,
+            "won":     net_pnl > 0,
+        })
+
+    print(f"Parsed {len(trades)} closed trades (IBKR symbol excluded)")
+    return trades
+
+
+# ── Step 4: Parse equity curve from EquitySummaryByReportDateInBase ───────────
+def parse_equity_curve(root):
+    """
+    Reads EquitySummaryByReportDateInBase entries.
+    Excludes value of IBKR gifted share from each day's balance.
+    """
+    # Build a map of date → IBKR stock value (to subtract)
+    ibkr_daily_value = {}
+    for pos in root.findall(".//OpenPosition"):
+        sym = (pos.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            report_date = pos.get("reportDate") or ""
+            mkt_val_str = pos.get("positionValue") or pos.get("markPrice") or "0"
+            qty_str     = pos.get("position") or "1"
+            try:
+                mkt_val = float(mkt_val_str)
+                # If only markPrice given, multiply by qty
+                if pos.get("positionValue") is None:
+                    mkt_val = float(mkt_val_str) * float(qty_str)
+                ibkr_daily_value[report_date] = mkt_val
+                print(f"  IBKR gifted share value on {report_date}: ${mkt_val:.2f} (will be excluded)")
+            except ValueError:
+                pass
+
+    # Also check MarkToMarket for daily IBKR values
+    for mtm in root.findall(".//MarkToMarketPerformanceSummaryUnderlying"):
+        sym = (mtm.get("symbol") or "").strip().upper()
+        if sym in EXCLUDED_SYMBOLS:
+            date_str = mtm.get("reportDate") or ""
+            val_str  = mtm.get("endingValue") or "0"
+            try:
+                ibkr_daily_value[date_str] = float(val_str)
+            except ValueError:
+                pass
+
+    # Parse daily equity totals
+    equity_points = []
+    for eq in root.findall(".//EquitySummaryByReportDateInBase"):
+        date_str = eq.get("reportDate") or ""
+        if not date_str:
+            continue
+
+        total_str = (
+            eq.get("total") or
+            eq.get("totalLong") or
+            eq.get("endingEquity") or
+            "0"
+        )
+        try:
+            total = float(total_str)
+        except ValueError:
+            continue
+
+        # Subtract excluded symbol value
+        excluded_val = ibkr_daily_value.get(date_str, 0.0)
+        adjusted     = total - excluded_val
+
+        equity_points.append({
+            "date":    date_str,
+            "balance": round(adjusted, 2),
+        })
+
+    # Sort by date
+    equity_points.sort(key=lambda x: x["date"])
+
+    if not equity_points:
+        return []
+
+    # Use the first data point (Sept 1 2026) as the starting balance.
+    # This is read directly from IBKR — no manual entry needed.
+    global STARTING_BALANCE
+    STARTING_BALANCE = equity_points[0]["balance"]
+    print(f"  Starting balance derived from Flex Query: "
+          f"${STARTING_BALANCE:.2f} on {equity_points[0]['date']}")
+
+    # Compute daily P&L — first day P&L is 0 (it IS the baseline)
+    curve = []
+    prev_balance = STARTING_BALANCE
+    for pt in equity_points:
+        daily_pnl = round(pt["balance"] - prev_balance, 2)
+        curve.append({
+            "date":      pt["date"],
+            "balance":   pt["balance"],
+            "daily_pnl": daily_pnl,
+        })
+        prev_balance = pt["balance"]
+
+    print(f"  Equity curve: {len(curve)} data points "
+          f"({equity_points[0]['date']} to {equity_points[-1]['date']})")
+    return curve
+
+
+# ── Step 5: Build metrics from trades and equity curve ────────────────────────
+def build_metrics(trades, equity_curve):
+    total_trades   = len(trades)
+    winning_trades = sum(1 for t in trades if t["won"])
+    losing_trades  = total_trades - winning_trades
+    win_rate_pct   = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+
+    gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gross_loss   = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+
+    ending_balance   = equity_curve[-1]["balance"] if equity_curve else STARTING_BALANCE
+    start_balance    = equity_curve[0]["balance"]  if equity_curve else STARTING_BALANCE
+    total_return_pct = ((ending_balance - start_balance) / start_balance * 100) if start_balance else 0
+
+    # Max drawdown
+    peak = STARTING_BALANCE
+    max_dd = 0.0
+    for pt in equity_curve:
+        bal = pt["balance"]
+        if bal > peak:
+            peak = bal
+        dd = (peak - bal) / peak * 100 if peak > 0 else 0
+        if dd > max_dd:
+            max_dd = dd
+
+    # Sharpe (simplified annualised daily returns)
+    daily_pnls = [pt["daily_pnl"] for pt in equity_curve if pt["daily_pnl"] != 0]
+    sharpe = 0.0
+    if len(daily_pnls) > 1:
+        import statistics
+        mean_pnl = statistics.mean(daily_pnls)
+        std_pnl  = statistics.stdev(daily_pnls)
+        if std_pnl > 0:
+            sharpe = round((mean_pnl / std_pnl) * (252 ** 0.5), 2)
+
+    return {
+        "starting_balance":  round(STARTING_BALANCE, 2),
+        "ending_balance":    round(ending_balance, 2),
+        "total_return_pct":  round(total_return_pct, 2),
+        "max_drawdown_pct":  round(max_dd, 2),
+        "sharpe_ratio":      sharpe,
+        "profit_factor":     round(profit_factor, 2),
+        "win_rate_pct":      round(win_rate_pct, 2),
+        "total_trades":      total_trades,
+        "winning_trades":    winning_trades,
+        "losing_trades":     losing_trades,
+    }
+
+
+# ── Step 6: Write JSON output ──────────────────────────────────────────────────
+def write_output(metrics, equity_curve):
+    os.makedirs("data", exist_ok=True)
+    payload = {
+        "strategy":      STRATEGY_NAME,
+        "track_from":    TRACK_FROM,
+        "last_updated":  datetime.date.today().isoformat(),
+        "metrics":       metrics,
+        "equity_curve":  equity_curve,
+        "excluded_symbols": list(EXCLUDED_SYMBOLS),
+    }
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Written: {OUTPUT_PATH}")
+    print(f"  Strategy:       {STRATEGY_NAME}")
+    print(f"  Trades:         {metrics['total_trades']}")
+    print(f"  Total Return:   {metrics['total_return_pct']:.2f}%")
+    print(f"  Max Drawdown:   {metrics['max_drawdown_pct']:.2f}%")
+    print(f"  Sharpe:         {metrics['sharpe_ratio']}")
+    print(f"  Excluded:       {list(EXCLUDED_SYMBOLS)}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    print(f"=== MAT8 Performance Sync: {STRATEGY_NAME} ===")
+    print(f"Excluded symbols: {EXCLUDED_SYMBOLS}")
+    print()
+
+    ref_code     = request_flex_statement()
+    root         = fetch_flex_statement(ref_code)
+
+    trades       = parse_trades(root)
+    equity_curve = parse_equity_curve(root)
+
+    if not equity_curve:
+        print("WARNING: No equity curve data found.")
+        print("  Check that EquitySummaryByReportDateInBase is enabled in your Flex Query.")
+        print(f"  Period requested: {TRACK_FROM} to {TRACK_TO}")
+        raise RuntimeError("Empty equity curve — cannot proceed without a starting balance.")
+
+    metrics = build_metrics(trades, equity_curve)
+    write_output(metrics, equity_curve)
+    print("\nSync complete.")
+
+
+if __name__ == "__main__":
+    main()
